@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
@@ -52,6 +51,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+_C128A_TOPK_ALIGNMENT = 128
 
 # For FP8 sparse attention we have two implementations:
 # 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
@@ -357,7 +358,6 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 # sm100 head64 kernel. Padded slots stay -1 and decode_lens caps
                 # them via topk_length, so the pad is a no-op at kernel level.
                 # Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
-                _C128A_TOPK_ALIGNMENT = 128
                 c128a_max_compressed = cdiv(
                     self.model_config.max_model_len, self.compress_ratio
                 )
@@ -569,18 +569,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         fast_build: bool = False,
     ) -> FlashMLASparseMetadata:
         cm = common_attn_metadata
-        num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
@@ -660,6 +649,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
+        active_topk_width = min(
+            max(
+                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
+                _C128A_TOPK_ALIGNMENT,
+            ),
+            self.c128a_max_compressed,
+        )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
@@ -672,7 +668,11 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_global_decode_buffer,
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
-            max_compressed_tokens=self.c128a_max_compressed,
+            max_compressed_tokens=active_topk_width,
+            fixed_row_stride=(
+                current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+            ),
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -1041,31 +1041,45 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    fixed_row_stride: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
     Decode tokens: position → block_table lookup → global slot ids + topk_lens.
     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
 
-    Writes into pre-allocated buffers for CUDA graph address stability.
-    Returns slices of the buffers.
+    On SM70 the logical width adapts to context length, but the physical row
+    stride stays fixed so CUDA Graph capture and replay agree on row addresses.
+    Other backends retain the upstream packed active-width layout.
     """
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
 
-    global_decode = global_decode_buffer[:num_decode_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens]
+    if fixed_row_stride:
+        global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
+        prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
+        global_decode_stride = global_decode_buffer.stride(0)
+        prefill_local_stride = prefill_buffer.stride(0)
+    else:
+        global_decode = global_decode_buffer.view(-1)[
+            : num_decode_tokens * max_compressed_tokens
+        ].view(num_decode_tokens, max_compressed_tokens)
+        prefill_local = prefill_buffer.view(-1)[
+            : num_prefill_tokens * max_compressed_tokens
+        ].view(num_prefill_tokens, max_compressed_tokens)
+        global_decode_stride = max_compressed_tokens
+        prefill_local_stride = max_compressed_tokens
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
 
     _build_c128a_topk_metadata_kernel[(num_tokens,)](
         global_decode_buffer,
-        global_decode_buffer.stride(0),
+        global_decode_stride,
         decode_lens_buffer,
         prefill_buffer,
-        prefill_buffer.stride(0),
+        prefill_local_stride,
         positions,
         compress_ratio,
         max_compressed_tokens,

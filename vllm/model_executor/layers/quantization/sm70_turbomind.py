@@ -7,6 +7,7 @@ from typing import Literal
 import torch
 
 from vllm import envs
+from vllm.platforms import current_platform
 
 U4_GROUP_SIZES = (32, 64, 128)
 GPTQ_GROUP_SIZES = (128,)
@@ -46,6 +47,23 @@ def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
     return torch.cuda.get_device_capability(tensor.device) == (7, 0)
 
 
+def is_exact_sm70_cuda_platform() -> bool:
+    """Return true only for Volta SM70 CUDA workers.
+
+    Quant-method selection runs before a layer owns a CUDA tensor, so it
+    cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
+    from the tensor-based helpers used by linear weight preparation.
+    """
+    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+
+
+def should_use_mxfp4_moe_turbomind() -> bool:
+    """Select the native MXFP4 MoE path only on exact SM70."""
+    return is_exact_sm70_cuda_platform() and use_turbomind(
+        envs.VLLM_SM70_MXFP4_TURBOMIND
+    )
+
+
 def should_prepare_turbomind(
     tensor: torch.Tensor,
     default_enabled: bool,
@@ -57,9 +75,7 @@ def should_prepare_turbomind_or_marlin(
     tensor: torch.Tensor,
     default_enabled: bool,
 ) -> bool:
-    return is_exact_sm70_cuda(
-        tensor, use_turbomind(default_enabled) or forces_marlin()
-    )
+    return is_exact_sm70_cuda(tensor, use_turbomind(default_enabled) or forces_marlin())
 
 
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
@@ -146,8 +162,7 @@ def prepare_gptq_linear(
 ) -> None:
     if group_size not in GPTQ_GROUP_SIZES:
         raise RuntimeError(
-            "SM70 TurboMind GPTQ supports group_size 128, "
-            f"but got {group_size}."
+            f"SM70 TurboMind GPTQ supports group_size 128, but got {group_size}."
         )
     if not hasattr(torch.ops._C, "uint4_sm70_prepare"):
         raise RuntimeError(
@@ -251,9 +266,13 @@ def prepare_nvfp4_linear(
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
     scales = (
-        layer.weight_scale.data.t().to(torch.float32)
-        * layer.weight_global_scale.to(torch.float32)
-    ).to(torch.float16).contiguous()
+        (
+            layer.weight_scale.data.t().to(torch.float32)
+            * layer.weight_global_scale.to(torch.float32)
+        )
+        .to(torch.float16)
+        .contiguous()
+    )
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
     )

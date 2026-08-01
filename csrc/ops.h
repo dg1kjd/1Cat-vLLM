@@ -428,6 +428,17 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out,
                                   int64_t n,
                                   int64_t group_size);
 
+void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out,
+                                    torch::Tensor input,
+                                    torch::Tensor expert_offsets,
+                                    torch::Tensor dense_expert_ids,
+                                    torch::Tensor ptrs_w,
+                                    torch::Tensor ptrs_s,
+                                    int64_t num_experts,
+                                    int64_t k,
+                                    int64_t n,
+                                    int64_t group_size);
+
 void fp8_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out,
     torch::Tensor input,

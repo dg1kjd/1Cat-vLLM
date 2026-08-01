@@ -16,8 +16,11 @@ preparation.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+
+from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
 
 
 @triton.jit
@@ -39,6 +42,7 @@ def quantize_and_insert_k_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+    use_software_fp8: tl.constexpr,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -112,9 +116,11 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+            if use_software_fp8:
+                x_uint8 = fp32_to_fp8_e4m3fn_bits(x_clamped.to(tl.float32))
+            else:
+                x_fp8 = x_clamped.to(tl.float8e4nv)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -140,7 +146,7 @@ def quantize_and_insert_k_kernel(
 
 
 def quantize_and_insert_k_cache(
-    k: torch.Tensor,  # [num_tokens, 512] bf16
+    k: torch.Tensor,  # [num_tokens, 512] fp16 or bf16
     k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
     slot_mapping: torch.Tensor,  # [num_tokens] int64
     block_size: int = 64,
@@ -159,7 +165,9 @@ def quantize_and_insert_k_cache(
     assert k.dim() == 2 and k.shape[1] == 512, (
         f"K must be [num_tokens, 512], got {k.shape}"
     )
-    assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    assert k.dtype in (torch.float16, torch.bfloat16), (
+        f"K must be fp16 or bf16, got {k.dtype}"
+    )
     assert is_ue8m0, "Only support ue8m0 quantization."
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
@@ -191,6 +199,9 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
+        use_software_fp8=(
+            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+        ),
     )
 
 
@@ -216,6 +227,7 @@ def _dequantize_and_gather_k_kernel(
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
+    use_software_fp8: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -273,11 +285,11 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                if use_software_fp8:
+                    x_float = fp8_e4m3fn_bits_to_fp32(x_uint8)
+                else:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                    x_float = x_fp8.to(tl.float32)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -288,8 +300,11 @@ def _dequantize_and_gather_k_kernel(
                 # Dequantize: bf16_value = fp8_value * scale
                 x_dequant = x_float * scale
 
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                tl.store(
+                    output_row_ptr + offsets,
+                    x_dequant.to(out_ptr.type.element_ty),
+                    mask=mask,
+                )
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -347,6 +362,9 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
+        use_software_fp8=(
+            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+        ),
     )
 
 
@@ -364,7 +382,10 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    if has_cutedsl():
+    use_cutedsl = has_cutedsl() and not (
+        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    )
+    if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -483,6 +504,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
@@ -491,15 +513,20 @@ def combine_topk_swa_indices(
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
-    combined_indices = torch.full(
-        (num_tokens, combined_topk),
-        fill_value=-1,
-        dtype=torch.int32,
-        device=topk_indices.device,
-    )
-    combined_lens = torch.empty(
-        num_tokens, dtype=torch.int32, device=topk_indices.device
-    )
+    if out is None:
+        combined_indices = torch.full(
+            (num_tokens, combined_topk),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+        combined_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
+    else:
+        combined_indices, combined_lens = out
+        assert combined_indices.shape == (num_tokens, combined_topk)
+        assert combined_lens.shape == (num_tokens,)
 
     NUM_WORKERS = 128
     _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](

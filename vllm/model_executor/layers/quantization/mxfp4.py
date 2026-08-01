@@ -799,3 +799,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
         )
+
+
+def make_deepseek_v4_mxfp4_moe_method(
+    moe: FusedMoEConfig,
+) -> FusedMoEMethodBase:
+    """Construct the DeepSeek-V4 MXFP4 MoE implementation for this device.
+
+    Volta cannot use the upstream CUDA MXFP4 implementations.  It must take
+    the native TurboMind path or fail explicitly: silently falling through to
+    Marlin or an emulation backend would change the deployment contract and
+    duplicate full expert weights.
+    """
+    from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
+
+    if sm70_tm.is_exact_sm70_cuda_platform():
+        if not sm70_tm.should_use_mxfp4_moe_turbomind():
+            raise NotImplementedError(
+                "DeepSeek-V4 MXFP4 MoE on SM70 requires the native TurboMind "
+                "backend. Marlin and MXFP4 weight emulation are not supported."
+            )
+        from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
+            Mxfp4SM70MoEMethod,
+        )
+
+        return Mxfp4SM70MoEMethod(moe)
+
+    return Mxfp4MoEMethod(moe)

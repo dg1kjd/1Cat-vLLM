@@ -417,6 +417,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &fp8_moe_dense_stage_sm70_out);
 
   ops.def(
+      "mxfp4_moe_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
+           &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
       "fp8_moe_single_token_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "

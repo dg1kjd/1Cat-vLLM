@@ -52,6 +52,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -75,6 +76,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@triton.jit
+def _fill_short_context_topk_indices(
+    output,
+    positions,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, PADDED_TOP_K)
+    num_compressed = (tl.load(positions + row) + 1) // COMPRESS_RATIO
+    tl.store(
+        output + row * TOP_K + offsets,
+        tl.where(offsets < num_compressed, offsets, -1),
+        mask=offsets < TOP_K,
+    )
+
+
+def _is_exact_sm70_cuda() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+
+
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
     if current_platform.is_rocm():
@@ -83,6 +106,15 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
+    if _is_exact_sm70_cuda():
+        from vllm.models.deepseek_v4.sm70.sparse import (
+            DeepseekV4SM70SparseImpl,
+        )
+
+        logger.info_once(
+            "DeepSeek V4 route: SM70 FP16 Triton sparse MLA with packed FP8 KV."
+        )
+        return DeepseekV4SM70SparseImpl
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
     )
@@ -151,6 +183,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self._use_sm70_path = _is_exact_sm70_cuda()
         self.n_local_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
@@ -301,6 +334,21 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.layer_name,
         )
         o = o_padded[:, : self.n_local_heads, :]
+
+        if self._use_sm70_path:
+            from vllm.models.deepseek_v4.sm70.projection import (
+                sm70_grouped_output_projection,
+            )
+
+            return sm70_grouped_output_projection(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.wo_a,
+                self.wo_b,
+            )
 
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
@@ -521,6 +569,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+
+        if self._use_sm70_path:
+            from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
+                sm70_qnorm_rope_kv_fp8_insert,
+            )
+
+            return sm70_qnorm_rope_kv_fp8_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE,
@@ -833,6 +897,27 @@ class DeepseekV4Indexer(nn.Module):
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
         compressor = self.compressor
+
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+                compressor(compressed_kv_score, positions, rotary_emb)
+                assert self.topk_indices_buffer is not None
+                num_tokens = (
+                    indexer_metadata.num_decode_tokens
+                    + indexer_metadata.num_prefill_tokens
+                )
+                if num_tokens > 0:
+                    _fill_short_context_topk_indices[(num_tokens,)](
+                        self.topk_indices_buffer,
+                        positions,
+                        TOP_K=self.topk_tokens,
+                        COMPRESS_RATIO=self.compress_ratio,
+                        PADDED_TOP_K=triton.next_power_of_2(self.topk_tokens),
+                        num_warps=8,
+                    )
+                return self.topk_indices_buffer
 
         def wq_b_and_q_quant():
             # ReplicatedLinear returns (output, bias); bias is None.

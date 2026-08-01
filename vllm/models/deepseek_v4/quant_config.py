@@ -11,7 +11,9 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.mxfp4 import (
+    make_deepseek_v4_mxfp4_moe_method,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -147,7 +149,7 @@ class DeepseekV4FP8Config(Fp8Config):
                         quant_config=self._get_nvfp4_config(),
                         moe_config=layer.moe_config,
                     )
-                return Mxfp4MoEMethod(layer.moe_config)
+                return make_deepseek_v4_mxfp4_moe_method(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)

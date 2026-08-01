@@ -3,11 +3,71 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
+
+
+@triton.jit
+def _sm70_indexer_q_rope_kernel(
+    positions_ptr,
+    q_ptr,
+    q_stride0,
+    q_stride1,
+    cos_sin_ptr,
+    cos_sin_stride,
+    weights_ptr,
+    weights_stride,
+    q_out_ptr,
+    q_out_stride0,
+    q_out_stride1,
+    weights_out_ptr,
+    weights_out_stride,
+    weights_softmax_scale,
+    weights_head_scale,
+    HEAD_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    rope_dim: tl.constexpr = HALF_ROPE * 2
+    nope_dim: tl.constexpr = HEAD_DIM - rope_dim
+    offsets = tl.arange(0, HEAD_DIM)
+    q_base = q_ptr + token_idx * q_stride0 + head_idx * q_stride1
+    out_base = q_out_ptr + token_idx * q_out_stride0 + head_idx * q_out_stride1
+    tl.store(
+        out_base + offsets,
+        tl.load(q_base + offsets, mask=offsets < nope_dim),
+        mask=offsets < nope_dim,
+    )
+
+    pos = tl.load(positions_ptr + token_idx)
+    pair_idx = tl.arange(0, HALF_ROPE)
+    cos = tl.load(cos_sin_ptr + pos * cos_sin_stride + pair_idx).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * cos_sin_stride + HALF_ROPE + pair_idx).to(
+        tl.float32
+    )
+    even_offsets = nope_dim + pair_idx * 2
+    odd_offsets = even_offsets + 1
+    even = tl.load(q_base + even_offsets).to(tl.float32)
+    odd = tl.load(q_base + odd_offsets).to(tl.float32)
+    tl.store(
+        out_base + even_offsets,
+        (even * cos - odd * sin).to(q_out_ptr.type.element_ty),
+    )
+    tl.store(
+        out_base + odd_offsets,
+        (odd * cos + even * sin).to(q_out_ptr.type.element_ty),
+    )
+
+    weight = tl.load(weights_ptr + token_idx * weights_stride + head_idx).to(tl.float32)
+    tl.store(
+        weights_out_ptr + token_idx * weights_out_stride + head_idx,
+        weight * weights_softmax_scale * weights_head_scale,
+    )
 
 
 @triton.jit
@@ -327,6 +387,36 @@ def fused_indexer_q_rope_quant(
     index_q_head_dim = index_q.shape[2]
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+
+    if current_platform.is_cuda() and current_platform.is_device_capability((7, 0)):
+        if use_fp4:
+            raise RuntimeError(
+                "DeepSeek V4 SM70 uses the FP8 indexer cache; FP4 indexer "
+                "cache requires newer instructions."
+            )
+        assert index_q.dtype == torch.float16
+        index_q_out = torch.empty_like(index_q)
+        _sm70_indexer_q_rope_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_weights,
+            index_weights.stride(0),
+            index_q_out,
+            index_q_out.stride(0),
+            index_q_out.stride(1),
+            index_weights_out,
+            index_weights_out.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            HEAD_DIM=index_q_head_dim,
+            HALF_ROPE=index_q_cos_sin_cache.shape[-1] // 2,
+            num_warps=1,
+        )
+        return index_q_out, index_weights_out
 
     if use_fp4:
         assert index_q_head_dim % MXFP4_BLOCK_SIZE == 0, (

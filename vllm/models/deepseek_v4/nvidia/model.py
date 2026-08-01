@@ -19,6 +19,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
     mhc_post_tilelang,
+    mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -58,6 +59,7 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4MultiHeadLatentAttentionWrapper,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 
@@ -821,6 +823,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
@@ -870,20 +873,37 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
             # Run standalone mhc_pre on first layer
-            residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
-                x,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                norm_weight=attn_norm_weight,
-                norm_eps=attn_norm_eps,
-            )
+            if x.dim() == 2:
+                assert self.hc_attn_fn_broadcast is not None
+                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                    fn_broadcast=self.hc_attn_fn_broadcast,
+                )
+            else:
+                residual = x
+                post_mix, res_mix, x = mhc_pre_tilelang(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=attn_norm_weight,
+                    norm_eps=attn_norm_eps,
+                )
         else:
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                 x,
@@ -1012,13 +1032,11 @@ class DeepseekV4Model(nn.Module):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        # Pre-hc_head residual stream buffer for the MTP draft. Stable
-        # address (outside the cudagraph pool) so the copy_ in forward()
-        # refreshes it correctly across captured shapes.
-        # refreshes it correctly across captured shapes. Only allocated on
-        # the last PP rank — that's where MTP target hidden states are
-        # produced.
-        if get_pp_group().is_last_rank:
+        spec_config = vllm_config.speculative_config
+        needs_mtp_hidden_states = spec_config is not None and (
+            spec_config.use_eagle() or spec_config.uses_draft_model()
+        )
+        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1036,10 +1054,8 @@ class DeepseekV4Model(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        # PP intermediate tensors carry the multi-stream hidden_states
-        # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
-        # token embedding to hc_mult streams before the first decoder
-        # layer and keeps that shape until hc_head() collapses it.
+        # PP intermediate tensors carry the multi-stream hidden states after
+        # the first layer's mHC broadcast and before hc_head collapses them.
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
@@ -1062,7 +1078,6 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1088,9 +1103,9 @@ class DeepseekV4Model(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if self._mtp_hidden_buffer is not None:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,
@@ -1220,6 +1235,17 @@ class DeepseekV4Model(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
+    def finalize_mhc_broadcast_weights(self) -> None:
+        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
+            return
+        layer = self.layers[self.start_layer]
+        if isinstance(layer, DeepseekV4DecoderLayer):
+            layer.hc_attn_fn_broadcast = (
+                layer.hc_attn_fn.detach()
+                .view(-1, layer.hc_mult, layer.hidden_size)
+                .sum(dim=1)
+            )
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -1268,6 +1294,16 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and vllm_config.model_config.dtype != torch.float16
+        ):
+            raise ValueError(
+                "DeepSeek V4 on SM70 requires --dtype half; V100 has no "
+                "native BF16 tensor-core path."
+            )
 
         config = vllm_config.model_config.hf_config
         self.config = config
@@ -1323,6 +1359,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
+        self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
