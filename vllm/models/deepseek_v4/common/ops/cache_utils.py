@@ -14,13 +14,18 @@ preparation.
   window indices for sparse prefill.
 """
 
+import time
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
 from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -493,6 +498,31 @@ def _compute_global_topk_indices_and_lens_kernel(
 # range via `topk_length`, so padding is a no-op at kernel level.
 _SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
+_combined_out_mismatch_state = {"last_warn": 0.0, "count": 0}
+
+
+def _warn_combined_out_mismatch(detail: str) -> None:
+    """Throttled (60s) warning for a stale `out` buffer in
+    combine_topk_swa_indices, plus a cumulative occurrence count.
+
+    A persistent `out` buffer whose shape/dtype/device no longer matches the
+    current chunk (seen under spec-decode + mixed prefill batches) used to hit
+    an assert here and take down every TP worker and the EngineCore with it.
+    Never fail silently, but never crash the engine over it either.
+    """
+    _combined_out_mismatch_state["count"] += 1
+    now = time.monotonic()
+    if now - _combined_out_mismatch_state["last_warn"] < 60.0:
+        return
+    _combined_out_mismatch_state["last_warn"] = now
+    logger.warning(
+        "combine_topk_swa_indices: `out` buffer mismatch (%s), "
+        "cumulative_occurrences=%d - falling back to a fresh allocation "
+        "instead of asserting.",
+        detail,
+        _combined_out_mismatch_state["count"],
+    )
+
 
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
@@ -513,6 +543,27 @@ def combine_topk_swa_indices(
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
+    if out is not None:
+        combined_indices, combined_lens = out
+        if (
+            combined_indices.shape != (num_tokens, combined_topk)
+            or combined_lens.shape != (num_tokens,)
+            or combined_indices.dtype != torch.int32
+            or combined_lens.dtype != torch.int32
+            or combined_indices.device != topk_indices.device
+            or combined_lens.device != topk_indices.device
+        ):
+            # Degrade to a fresh allocation instead of asserting - identical
+            # to the out=None path below and always correct, since both call
+            # sites (sm70/sparse.py, nvidia/flashmla.py) consume the
+            # RETURNED tensors rather than relying on `out` being mutated
+            # in place.
+            _warn_combined_out_mismatch(
+                f"out_shape={tuple(combined_indices.shape)}/"
+                f"{tuple(combined_lens.shape)} "
+                f"expected=({num_tokens}, {combined_topk})/({num_tokens},)"
+            )
+            out = None
     if out is None:
         combined_indices = torch.full(
             (num_tokens, combined_topk),
@@ -523,10 +574,6 @@ def combine_topk_swa_indices(
         combined_lens = torch.empty(
             num_tokens, dtype=torch.int32, device=topk_indices.device
         )
-    else:
-        combined_indices, combined_lens = out
-        assert combined_indices.shape == (num_tokens, combined_topk)
-        assert combined_lens.shape == (num_tokens,)
 
     NUM_WORKERS = 128
     _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](

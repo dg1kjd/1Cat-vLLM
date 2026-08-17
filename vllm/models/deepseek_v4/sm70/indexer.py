@@ -3,6 +3,9 @@
 
 """DeepSeek V4 C4 indexer fallback using FP16 HMMA on SM70."""
 
+import os
+import warnings
+
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
@@ -12,6 +15,24 @@ from vllm.triton_utils import tl, triton
 
 _INDEX_HEAD_DIM = 128
 _INDEX_CACHE_BYTES = _INDEX_HEAD_DIM + 4
+
+# Cap (MiB) on the decode gathered_k workspace. Uncapped, the allocation is
+# [rows, max_seq_len, 128] fp16 - with a full spec-decode batch and a long
+# max_seq_len this can transiently request several GiB in one shot, which is
+# enough to OOM-kill all TP workers on a V100 where only a few hundred MiB
+# are typically free during decode. Chunking by rows is numerically exact
+# (each bmm row is independent). 0 restores the original single-shot
+# allocation. Read once at import time - no getenv in the hot path.
+try:
+    _DECODE_GATHER_CAP_MB = int(os.getenv("VLLM_SM70_INDEXER_CHUNK_MB", "256"))
+except ValueError:
+    _bad_value = os.getenv("VLLM_SM70_INDEXER_CHUNK_MB")
+    warnings.warn(
+        f"VLLM_SM70_INDEXER_CHUNK_MB is not an integer ({_bad_value!r}); "
+        "using the default of 256 MiB.",
+        stacklevel=1,
+    )
+    _DECODE_GATHER_CAP_MB = 256
 
 
 @triton.jit
@@ -195,32 +216,64 @@ def sm70_indexer_decode_logits(
     assert block_table.shape[0] == weighted_q.shape[0]
 
     max_seq_len = max(1, int(max_seq_len))
+    total_rows = weighted_q.shape[0]
+    block_n = 16
+
+    row_bytes = max_seq_len * _INDEX_HEAD_DIM * 2  # fp16
+    if _DECODE_GATHER_CAP_MB > 0:
+        rows_per_chunk = max(1, (_DECODE_GATHER_CAP_MB * 1024 * 1024) // row_bytes)
+    else:
+        rows_per_chunk = total_rows
+
+    if rows_per_chunk >= total_rows:
+        # Single chunk covering every row - identical to the pre-chunking
+        # behavior (same allocation, same kernel, same bmm).
+        row_chunks = [(0, total_rows)]
+    else:
+        row_chunks = [
+            (start, min(start + rows_per_chunk, total_rows))
+            for start in range(0, total_rows, rows_per_chunk)
+        ]
+
+    out = torch.empty(
+        (total_rows, max_seq_len), dtype=torch.float32, device=q.device
+    )
+    # Reused across chunks to avoid allocator churn under memory pressure.
     gathered_k = torch.empty(
-        (weighted_q.shape[0], max_seq_len, _INDEX_HEAD_DIM),
+        (min(rows_per_chunk, total_rows), max_seq_len, _INDEX_HEAD_DIM),
         dtype=torch.float16,
         device=q.device,
     )
-    block_n = 16
-    _dequant_paged_index_k_kernel[
-        (weighted_q.shape[0], triton.cdiv(max_seq_len, block_n))
-    ](
-        cache,
-        block_table,
-        flat_lens,
-        gathered_k,
-        cache.stride(0),
-        cache.stride(1),
-        block_table.stride(0),
-        gathered_k.stride(0),
-        gathered_k.stride(1),
-        cache.shape[1],
-        max_seq_len,
-        head_dim=_INDEX_HEAD_DIM,
-        BLOCK_N=block_n,
-        num_warps=4,
-    )
-    return torch.bmm(
-        weighted_q.unsqueeze(1),
-        gathered_k.transpose(1, 2),
-        out_dtype=torch.float32,
-    ).squeeze(1)
+    multi_chunk = len(row_chunks) > 1
+    for start, end in row_chunks:
+        rows = end - start
+        gathered_view = gathered_k[:rows]
+        if multi_chunk:
+            # The kernel only writes positions < seq_len for each row, so a
+            # reused buffer would otherwise carry stale K from a previous
+            # chunk's request into this chunk's masked-out tail slots.
+            # Downstream masking by context_lens already covers this, but
+            # the memset (~0.3ms) removes the risk class outright.
+            gathered_view.zero_()
+        _dequant_paged_index_k_kernel[(rows, triton.cdiv(max_seq_len, block_n))](
+            cache,
+            block_table[start:end],
+            flat_lens[start:end],
+            gathered_view,
+            cache.stride(0),
+            cache.stride(1),
+            block_table.stride(0),
+            gathered_view.stride(0),
+            gathered_view.stride(1),
+            cache.shape[1],
+            max_seq_len,
+            head_dim=_INDEX_HEAD_DIM,
+            BLOCK_N=block_n,
+            num_warps=4,
+        )
+        out[start:end] = torch.bmm(
+            weighted_q[start:end].unsqueeze(1),
+            gathered_view.transpose(1, 2),
+            out_dtype=torch.float32,
+        ).squeeze(1)
+    return out
