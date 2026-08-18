@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
+    VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1746,6 +1747,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
+    ),
+    # The SM70 MXFP4 MoE dense stage launches one GEMM per local expert so the
+    # launch count stays static for CUDA graph capture. At decode only
+    # num_tokens*top_k experts can hold tokens (6 at batch 1, out of 256), so
+    # the other ~250 launches per stage per layer are empty kernels. When this
+    # is on, the active experts are compacted on-device into the first slots
+    # and the loop is bounded by num_tokens*top_k, which is still static for a
+    # captured batch size. Set to 0 to restore the full-width loop.
+    "VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS", "1"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and

@@ -15,6 +15,7 @@ import torch
 from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -386,6 +387,18 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_dense_expert_ids = torch.arange(
             num_experts, dtype=torch.int32, device=device
         )
+        # `num_experts` doubles as the inactive sentinel: it sorts after every
+        # real id and indexes expert_offsets[num_experts] == total_slots, which
+        # makes a padded slot an empty range.
+        layer._mxfp4_sm70_buf_expert_sentinel = torch.full(
+            (num_experts,), num_experts, dtype=torch.int32, device=device
+        )
+        layer._mxfp4_sm70_buf_compact_expert_ids = torch.empty(
+            num_experts, dtype=torch.int32, device=device
+        )
+        layer._mxfp4_sm70_buf_compact_offsets = torch.empty(
+            num_experts + 1, dtype=torch.int32, device=device
+        )
 
     @staticmethod
     def _persistent_b1_buffers(layer: RoutedExperts) -> dict[str, torch.Tensor]:
@@ -406,6 +419,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx,
             "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
+            "expert_sentinel": layer._mxfp4_sm70_buf_expert_sentinel,
+            "compact_expert_ids": layer._mxfp4_sm70_buf_compact_expert_ids,
+            "compact_offsets": layer._mxfp4_sm70_buf_compact_offsets,
         }
 
     @staticmethod
@@ -469,6 +485,13 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 total_slots, dtype=torch.int32, device=device
             ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
+            "expert_sentinel": layer._mxfp4_sm70_buf_expert_sentinel,
+            "compact_expert_ids": torch.empty(
+                num_experts, dtype=torch.int32, device=device
+            ),
+            "compact_offsets": torch.empty(
+                num_experts + 1, dtype=torch.int32, device=device
+            ),
         }
 
     def _get_buffers(
@@ -481,6 +504,45 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         # these allocations in that graph's pool. Its replay stability is a
         # separate GPU gate and is not claimed by the B1 contract.
         return self._eager_buffers(layer, num_tokens)
+
+    @staticmethod
+    def _compact_active_experts(
+        buffers: dict[str, torch.Tensor], num_experts: int, bound: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Narrow the dense-stage expert loop to the ones that hold tokens.
+
+        The dense stage launches one GEMM per loop slot, so its cost is set by
+        the loop width, not by how many experts actually have work. At decode
+        at most ``num_tokens * top_k`` experts can be non-empty, which is 6 of
+        256 at batch 1 -- the other ~250 launches per stage per layer are empty
+        kernels that still pay full launch cost.
+
+        `moe_permute_with_scratch` sorts the permuted rows by expert id, so
+        empty buckets are zero-width and the non-empty ones stay contiguous.
+        That means the compacted CSR is just the gathered start offsets: the
+        end of active expert j is exactly the start of active expert j+1.
+
+        Everything here is fixed-shape with no host sync, so it stays capturable;
+        `bound` is derived from the (static) captured batch size.
+        """
+        offsets = buffers["expert_offsets"]
+        counts = offsets[1 : num_experts + 1] - offsets[:num_experts]
+        keyed = torch.where(
+            counts > 0, buffers["dense_expert_ids"], buffers["expert_sentinel"]
+        )
+        ranked = torch.sort(keyed).values[:bound]
+
+        compact_offsets = buffers["compact_offsets"][: bound + 1]
+        torch.index_select(
+            offsets, 0, ranked.to(torch.int32), out=compact_offsets[:bound]
+        )
+        # Closes the last real range and leaves every padded slot empty.
+        compact_offsets[bound : bound + 1].copy_(
+            offsets[num_experts : num_experts + 1]
+        )
+        compact_ids = buffers["compact_expert_ids"][:bound]
+        torch.clamp(ranked, max=num_experts - 1, out=compact_ids)
+        return compact_ids, compact_offsets
 
     @staticmethod
     def _apply_swiglu(
@@ -556,14 +618,24 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
 
+        num_experts = int(layer.sm70_mxfp4_num_experts)
+        stage_offsets = buffers["expert_offsets"]
+        stage_ids = buffers["dense_expert_ids"]
+        stage_experts = num_experts
+        if envs.VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS and total_slots < num_experts:
+            stage_ids, stage_offsets = self._compact_active_experts(
+                buffers, num_experts, total_slots
+            )
+            stage_experts = total_slots
+
         sm70_ops.mxfp4_moe_dense_stage_sm70_out(
             buffers["gate_up"],
             buffers["permuted_input"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_ids,
             layer.w13_strided_ptrs_w,
             layer.w13_strided_ptrs_s,
-            layer.sm70_mxfp4_num_experts,
+            stage_experts,
             layer.sm70_mxfp4_w13_k_dim,
             layer.sm70_mxfp4_w13_n_dim,
             layer.sm70_mxfp4_group_size,
@@ -572,11 +644,11 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         sm70_ops.mxfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
             buffers["intermediate"],
-            buffers["expert_offsets"],
-            buffers["dense_expert_ids"],
+            stage_offsets,
+            stage_ids,
             layer.w2_strided_ptrs_w,
             layer.w2_strided_ptrs_s,
-            layer.sm70_mxfp4_num_experts,
+            stage_experts,
             layer.sm70_mxfp4_w2_k_dim,
             layer.sm70_mxfp4_w2_n_dim,
             layer.sm70_mxfp4_group_size,
