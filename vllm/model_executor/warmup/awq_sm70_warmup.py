@@ -184,6 +184,20 @@ def _iter_unique_fp8_dense_layers(
         if not getattr(layer, "sm70_fp8_turbomind", False):
             continue
 
+        if getattr(layer, "sm70_fp8_bmm", False):
+            # Grouped-BMM layers stack their prepared groups, so `weight` is
+            # [groups, K, N] and `output_size_per_partition` spans all groups.
+            # apply() runs one 2D GEMM per group; warm up that same shape.
+            key = (
+                int(layer.weight.shape[1]),
+                int(layer.sm70_fp8_bmm_output_size),
+                False,
+            )
+            if key not in seen:
+                seen.add(key)
+                yield layer, False
+            continue
+
         k_dim = int(layer.weight.shape[0])
         n_dim = int(layer.output_size_per_partition)
         if not getattr(layer, "sm70_fp8_gated_silu_primary", False):
@@ -348,6 +362,14 @@ def _warmup_fp8_dense_layers(
                 k_ld = int(layer.sm70_fp8_gated_silu_k_ld)
                 q_ld = int(layer.sm70_fp8_gated_silu_q_ld)
             n_dim = int(weight.shape[1]) // 2
+        elif getattr(layer, "sm70_fp8_bmm", False):
+            # See _iter_unique_fp8_dense_layers: groups share one layout, so
+            # warming group 0 covers the shape apply() actually launches.
+            weight = layer.weight[0]
+            scales = layer.weight_scale_inv[0]
+            k_ld = int(layer.sm70_fp8_k_ld)
+            q_ld = int(layer.sm70_fp8_q_ld)
+            n_dim = int(layer.sm70_fp8_bmm_output_size)
         else:
             weight = layer.weight
             scales = layer.weight_scale_inv
@@ -357,6 +379,28 @@ def _warmup_fp8_dense_layers(
 
         device = weight.device
         k_dim = int(weight.shape[0])
+        # The kernel derives N from the weight and requires the scales to match
+        # it exactly. A mismatch here means the layer was collected with the
+        # wrong layout; warming up must not take the engine down over it.
+        expected_groups = (k_dim + 127) // 128
+        if (
+            weight.dim() != 2
+            or scales.dim() != 2
+            or int(scales.shape[0]) != expected_groups
+            or int(scales.shape[1]) != int(weight.shape[1])
+        ):
+            logger.warning(
+                "Skipping SM70 FP8 dense warmup for a layer whose prepared "
+                "shapes do not satisfy the kernel contract: weight=%s "
+                "scales=%s (expected scales=[%d, %d]), gated_silu=%s, bmm=%s.",
+                tuple(weight.shape),
+                tuple(scales.shape),
+                expected_groups,
+                int(weight.shape[1]) if weight.dim() == 2 else -1,
+                gated_silu,
+                getattr(layer, "sm70_fp8_bmm", False),
+            )
+            continue
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
