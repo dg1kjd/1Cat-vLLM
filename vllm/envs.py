@@ -192,6 +192,9 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS: bool = True
+    VLLM_SM70_SPARSE_SPLIT_KV: bool = True
+    VLLM_SM70_SPARSE_KV_MAX_SPLITS: int = 16
+    VLLM_SM70_SPARSE_KV_SPLIT_TARGET_BLOCKS: int = 64
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1757,6 +1760,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # captured batch size. Set to 0 to restore the full-width loop.
     "VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_EXPERTS", "1"))
+    ),
+    # The DeepSeek V4 SM70 paged sparse-MLA kernel parallelises only over
+    # (token, head block). At batch-1 decode with TP8 that is a single block of
+    # 4 warps on an 80-SM GPU (measured: 0.0125 blocks/SM, 0% occupancy, 39% of
+    # the decode step), with no warps left to hide the paged-cache gather
+    # latency. When this is on, decode-shaped launches split the key axis
+    # flash-decoding style and a second pass merges the partial softmaxes.
+    # Splitting by key keeps total KV traffic constant; splitting by head does
+    # not, which is why the head axis is left alone. Set to 0 for the
+    # single-pass kernel.
+    "VLLM_SM70_SPARSE_SPLIT_KV": lambda: bool(
+        int(os.getenv("VLLM_SM70_SPARSE_SPLIT_KV", "1"))
+    ),
+    # Upper bound on key-axis splits, and the block count the splitter aims to
+    # fill. Both are host-side static so a captured CUDA graph stays valid.
+    "VLLM_SM70_SPARSE_KV_MAX_SPLITS": lambda: int(
+        os.getenv("VLLM_SM70_SPARSE_KV_MAX_SPLITS", "16")
+    ),
+    "VLLM_SM70_SPARSE_KV_SPLIT_TARGET_BLOCKS": lambda: int(
+        os.getenv("VLLM_SM70_SPARSE_KV_SPLIT_TARGET_BLOCKS", "64")
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
