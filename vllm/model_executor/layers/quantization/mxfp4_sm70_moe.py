@@ -208,7 +208,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 "DeepSeek-V4 MXFP4 MoE graph-safe B1 requires "
                 "_moe_C.moe_permute_with_scratch."
             )
-        if layer.moe.has_bias:
+        if self.moe.has_bias:
             raise NotImplementedError("SM70 MXFP4 MoE does not support expert bias.")
         if layer.activation != MoEActivation.SILU:
             raise NotImplementedError(
