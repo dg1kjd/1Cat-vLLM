@@ -32,8 +32,54 @@ from vllm.model_executor.layers.quantization.sm70_turbomind import (
     is_exact_sm70_cuda,
     unpack_mxfp4_weight,
 )
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _compact_active_experts_kernel(
+    offsets_ptr,
+    ids_out_ptr,
+    offsets_out_ptr,
+    bound,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_REAL: tl.constexpr,
+    BOUND_BLOCK: tl.constexpr,
+):
+    """Gather the non-empty experts of a CSR expert-offset array into slot order.
+
+    Single block. Slot j takes the j-th expert that holds tokens; the padded
+    slots and the terminator all take the CSR total, which makes their ranges
+    empty so the dense stage skips them.
+
+    Written as a gather (compare every expert against every output slot) rather
+    than a scatter so no intra-block barrier is needed: BOUND_BLOCK is tiny
+    (8 at batch 1), so the comparison matrix is a few thousand elements.
+    """
+    experts = tl.arange(0, NUM_EXPERTS)
+    real = experts < NUM_EXPERTS_REAL
+    start = tl.load(offsets_ptr + experts, mask=real, other=0)
+    end = tl.load(offsets_ptr + experts + 1, mask=real, other=0)
+    total = tl.load(offsets_ptr + NUM_EXPERTS_REAL)
+
+    active = real & (end > start)
+    # Inclusive scan minus one: the destination slot of each active expert.
+    slot_of = tl.cumsum(active.to(tl.int32), axis=0) - 1
+
+    slots = tl.arange(0, BOUND_BLOCK)
+    hit = (slot_of[None, :] == slots[:, None]) & active[None, :]
+    found = tl.sum(hit.to(tl.int32), axis=1) > 0
+    slot_start = tl.sum(tl.where(hit, start[None, :], 0), axis=1)
+    slot_expert = tl.sum(tl.where(hit, experts[None, :].to(tl.int32), 0), axis=1)
+
+    tl.store(ids_out_ptr + slots, tl.where(found, slot_expert, 0), mask=slots < bound)
+    tl.store(
+        offsets_out_ptr + slots,
+        tl.where(found, slot_start, total),
+        mask=slots <= bound,
+    )
+
 
 _DEEPSEEK_V4_FLASH_HIDDEN_SIZE: Final = 4096
 _DEEPSEEK_V4_FLASH_INTERMEDIATE_SIZE: Final = 2048
@@ -387,12 +433,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_dense_expert_ids = torch.arange(
             num_experts, dtype=torch.int32, device=device
         )
-        # `num_experts` doubles as the inactive sentinel: it sorts after every
-        # real id and indexes expert_offsets[num_experts] == total_slots, which
-        # makes a padded slot an empty range.
-        layer._mxfp4_sm70_buf_expert_sentinel = torch.full(
-            (num_experts,), num_experts, dtype=torch.int32, device=device
-        )
         layer._mxfp4_sm70_buf_compact_expert_ids = torch.empty(
             num_experts, dtype=torch.int32, device=device
         )
@@ -419,7 +459,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "sorted_row_idx": layer._mxfp4_sm70_buf_sorted_row_idx,
             "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
-            "expert_sentinel": layer._mxfp4_sm70_buf_expert_sentinel,
             "compact_expert_ids": layer._mxfp4_sm70_buf_compact_expert_ids,
             "compact_offsets": layer._mxfp4_sm70_buf_compact_offsets,
         }
@@ -485,7 +524,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 total_slots, dtype=torch.int32, device=device
             ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
-            "expert_sentinel": layer._mxfp4_sm70_buf_expert_sentinel,
             "compact_expert_ids": torch.empty(
                 num_experts, dtype=torch.int32, device=device
             ),
@@ -524,24 +562,26 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
 
         Everything here is fixed-shape with no host sync, so it stays capturable;
         `bound` is derived from the (static) captured batch size.
+
+        This runs as a single Triton launch. The obvious torch spelling of it
+        (`torch.sort` on a sentinel-keyed id vector, then `index_select`) cost
+        52.8 us per call in a trace -- `radixSortKVInPlace` on 256 int32 in one
+        block of 32 threads -- which at 43 layers was 2.3 ms of every decode
+        step, more than the compaction itself saves at short context.
         """
         offsets = buffers["expert_offsets"]
-        counts = offsets[1 : num_experts + 1] - offsets[:num_experts]
-        keyed = torch.where(
-            counts > 0, buffers["dense_expert_ids"], buffers["expert_sentinel"]
-        )
-        ranked = torch.sort(keyed).values[:bound]
-
         compact_offsets = buffers["compact_offsets"][: bound + 1]
-        torch.index_select(
-            offsets, 0, ranked.to(torch.int32), out=compact_offsets[:bound]
-        )
-        # Closes the last real range and leaves every padded slot empty.
-        compact_offsets[bound : bound + 1].copy_(
-            offsets[num_experts : num_experts + 1]
-        )
         compact_ids = buffers["compact_expert_ids"][:bound]
-        torch.clamp(ranked, max=num_experts - 1, out=compact_ids)
+        _compact_active_experts_kernel[(1,)](
+            offsets,
+            compact_ids,
+            compact_offsets,
+            bound,
+            NUM_EXPERTS=triton.next_power_of_2(num_experts),
+            NUM_EXPERTS_REAL=num_experts,
+            BOUND_BLOCK=triton.next_power_of_2(bound + 1),
+            num_warps=4,
+        )
         return compact_ids, compact_offsets
 
     @staticmethod
