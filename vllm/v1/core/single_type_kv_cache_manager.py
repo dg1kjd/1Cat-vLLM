@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -26,6 +28,11 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Temporary: see which blocks the SWA prefix-cache scan can actually find.
+_SWA_PFX_DEBUG = os.getenv("VLLM_PFX_DEBUG", "0") == "1"
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -81,6 +88,12 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
+
+        # Set by the coordinator for groups that get the EAGLE/spec-decode
+        # last-block drop. `find_longest_cache_hit` then demands one more
+        # contiguous block than the window needs, so `_cache_block_mask` has
+        # to retain one more per aligned segment or the group can never hit.
+        self.use_eagle_drop = False
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -589,6 +602,25 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
         max_num_blocks = max_length // kv_cache_spec.block_size
+        if _SWA_PFX_DEBUG and max_num_blocks:
+            present = [
+                i
+                for i in range(max_num_blocks)
+                if block_pool.get_cached_block(block_hashes[i], kv_cache_group_ids)
+            ]
+            logger.info(
+                "swa-pfx-debug bs=%d win=%d align=%d eagle=%s need=%d "
+                "max_blocks=%d cached=%d first=%s last=%s",
+                kv_cache_spec.block_size,
+                kv_cache_spec.sliding_window,
+                alignment_tokens,
+                use_eagle,
+                sliding_window_contiguous_blocks,
+                max_num_blocks,
+                len(present),
+                present[:8],
+                present[-8:],
+            )
         computed_blocks = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
@@ -652,6 +684,29 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         assert alignment_tokens > self.block_size
         per_segment = alignment_tokens // self.block_size
         tail = cdiv(self.sliding_window - 1, self.block_size)
+
+        # This mask has to keep exactly the blocks `find_longest_cache_hit`
+        # can anchor on, or the group never hits and — in a hybrid model —
+        # drags every other group's hit down to zero with it.
+        #
+        # Without eagle the anchor is the LAST block of a segment (the scan
+        # requires `(i + 1) * block_size % alignment_tokens == 0`), so the run
+        # it needs is the segment's trailing `tail` blocks.
+        #
+        # With the eagle drop the anchor moves to the FIRST block of the next
+        # segment (`i * block_size % alignment_tokens == 0` after the pop), so
+        # the run straddles the boundary: that block plus the `tail` blocks
+        # before it. Keeping only the trailing `tail` leaves the anchor
+        # uncached and the hit is permanently 0.
+        if self.use_eagle_drop:
+            if tail + 1 >= per_segment:
+                return None
+            skip = per_segment - tail
+            return [
+                (i % per_segment == 0) or (i % per_segment >= skip)
+                for i in range(num_cached_blocks, num_full_blocks)
+            ]
+
         if tail >= per_segment:
             return None
         skip = per_segment - tail

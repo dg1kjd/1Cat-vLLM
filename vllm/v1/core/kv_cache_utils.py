@@ -1737,6 +1737,44 @@ def _report_kv_cache_config(
         max_concurrency,
     )
 
+    if os.getenv("VLLM_LOG_KV_CACHE_GROUPS", "0") == "1":
+        # Per-group accounting: which layer types are actually eating the pool.
+        # `max_memory_usage_bytes` is what the concurrency calculation divides
+        # by, so this is the breakdown behind the number logged above.
+        total = 0
+        for i, group in enumerate(kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            per_req = spec.max_memory_usage_bytes(vllm_config)
+            total += per_req
+            inner = spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                inner = next(iter(spec.kv_cache_specs.values()))
+            logger.info_once(
+                "KV group %d: %s x%d layers block=%s page=%sB "
+                "-> %.1f MiB/request (%.2f KiB/token at max_model_len) "
+                "[inner=%s head=%s cr=%s win=%s real_page=%s pad=%s e.g. %s]",
+                i,
+                type(spec).__name__,
+                len(group.layer_names),
+                getattr(spec, "block_size", "?"),
+                getattr(spec, "page_size_bytes", "?"),
+                per_req / 2**20,
+                per_req / max_model_len / 1024,
+                type(inner).__name__,
+                getattr(inner, "head_size", "?"),
+                getattr(inner, "compress_ratio", "?"),
+                getattr(inner, "sliding_window", "-"),
+                getattr(inner, "real_page_size_bytes", "?"),
+                getattr(inner, "page_size_padded", "?"),
+                group.layer_names[0],
+            )
+        logger.info_once(
+            "KV total: %.1f MiB/request = %.2f KiB/token at max_model_len=%d",
+            total / 2**20,
+            total / max_model_len / 1024,
+            max_model_len,
+        )
+
 
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,

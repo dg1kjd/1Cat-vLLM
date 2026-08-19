@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
 
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -23,6 +25,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Temporary: VLLM_PFX_DEBUG=1 logs the first N prefix-cache lookups with the
+# per-attention-type hit length, which is the only way to see which KV group
+# is collapsing the hit to zero.
+_PFX_DEBUG = os.getenv("VLLM_PFX_DEBUG", "0") == "1"
+_PFX_DEBUG_CALLS = int(os.getenv("VLLM_PFX_DEBUG_CALLS", "12"))
 
 
 class KVCacheCoordinator(ABC):
@@ -76,6 +86,12 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+        # Tell each manager whether its group takes the eagle last-block drop,
+        # so cache_blocks() retains enough blocks for find_longest_cache_hit()
+        # to match. Only the manager knows how many blocks its hit needs.
+        for i, manager in enumerate(self.single_type_managers):
+            manager.use_eagle_drop = i in self.eagle_group_ids
 
     def get_num_blocks_to_allocate(
         self,
@@ -431,6 +447,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        self._pfx_debug_calls = 0
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -475,6 +492,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # block cache hit yet.
         block_sizes = [spec.block_size for spec, _, _ in attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+        # A cache hit must be a multiple of this, and cache_blocks() rounds
+        # down to it, so an LCM larger than a typical prompt silently disables
+        # prefix caching altogether. Worth seeing at startup.
+        logger.info(
+            "Prefix cache alignment: lcm_block_size=%d from per-type block "
+            "sizes %s",
+            self.lcm_block_size,
+            block_sizes,
+        )
 
         # Attention-group indices (into ``self.attention_groups``) that
         # contain at least one EAGLE/MTP KV cache group.
@@ -483,6 +509,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
+
+        # find_longest_cache_hit runs once per *attention* group and only
+        # accepts a block cached for every KV group in it, so the eagle drop
+        # is an all-or-nothing property of the merged group. Setting it per KV
+        # group leaves the non-eagle members caching one block too few, and
+        # the intersection then never matches.
+        for idx in self.eagle_attn_group_indices:
+            for gid in self.attention_groups[idx][1]:
+                self.single_type_managers[gid].use_eagle_drop = True
+
+        if _PFX_DEBUG:
+            logger.info(
+                "pfx-debug eagle_group_ids=%s use_eagle_drop=%s",
+                sorted(self.eagle_group_ids),
+                [m.use_eagle_drop for m in self.single_type_managers],
+            )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         # Cache hits in this coordinator are always a multiple of
@@ -493,6 +535,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         num_computed_tokens = (
             num_computed_tokens // self.lcm_block_size * self.lcm_block_size
         )
+        if _PFX_DEBUG and self._pfx_debug_calls < _PFX_DEBUG_CALLS:
+            logger.info(
+                "pfx-debug cache_blocks req=%s aligned_computed=%d",
+                request.request_id,
+                num_computed_tokens,
+            )
         for manager in self.single_type_managers:
             manager.cache_blocks(
                 request,
@@ -545,6 +593,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
 
+        self._pfx_debug_calls += 1
         while True:
             curr_hit_length = hit_length
 
@@ -584,6 +633,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
+                if _PFX_DEBUG and self._pfx_debug_calls < _PFX_DEBUG_CALLS:
+                    logger.info(
+                        "pfx-debug lookup#%d type%d %s bs=%d win=%s "
+                        "max_len=%d -> hit=%d",
+                        self._pfx_debug_calls,
+                        idx,
+                        type(spec).__name__,
+                        spec.block_size,
+                        getattr(spec, "sliding_window", None),
+                        _max_length,
+                        _new_hit_length,
+                    )
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
