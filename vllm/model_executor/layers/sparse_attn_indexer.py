@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -31,6 +33,15 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+# Diagnostic: "lo:hi", a half-open band of *compressed* key indices (the units
+# the indexer scores in, i.e. token_index // compress_ratio). For the last
+# query row of every prefill chunk this logs where that band ranks among all
+# causally valid keys, and how many of its entries survived the top-k. A
+# needle-in-a-haystack miss is otherwise unattributable: it cannot distinguish
+# "the indexer never selected the needle" from "it selected it and the model
+# still could not read it". Off unless set; the check costs a device sync.
+_INDEXER_PROBE = os.getenv("VLLM_INDEXER_PROBE", "")
+
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -59,6 +70,184 @@ def _gather_workspace_shapes(
     return (
         ((total_seq_lens, head_dim), fp8_dtype),
         ((total_seq_lens, 4), torch.uint8),
+    )
+
+
+def _log_indexer_probe_rank(prefix, logits, topk_indices, cu_seqlen_ks, cu_seqlen_ke):
+    """Report where each `_INDEXER_PROBE` band ranks for the chunk's last row."""
+    ks = int(cu_seqlen_ks[-1].item())
+    ke = int(cu_seqlen_ke[-1].item())
+    row = logits[-1]
+    selected = topk_indices[-1]
+    for spec in _INDEXER_PROBE.split(","):
+        lo, hi = (int(v) for v in spec.split(":"))
+        band_lo, band_hi = max(lo, ks), min(hi, ke)
+        if band_hi <= band_lo:
+            continue
+        best = row[band_lo:band_hi].max()
+        # Rank among causally valid keys only; everything outside [ks, ke) is
+        # masked by the top-k kernel and must not count as a competitor.
+        rank = int((row[ks:ke] > best).sum().item())
+        kept = int(((selected >= lo) & (selected < hi)).sum().item())
+        logger.info(
+            "indexer-probe %s keys=%d band=[%d,%d) best_rank=%d kept=%d",
+            prefix,
+            ke - ks,
+            lo,
+            hi,
+            rank,
+            kept,
+        )
+
+
+def _log_indexer_probe_decode(prefix, logits, topk_indices, seq_lens):
+    """`_log_indexer_probe_rank` for the decode path.
+
+    Decode selects through a different kernel than prefill (`persistent_topk`
+    / `top_k_per_row_decode` rather than `top_k_per_row_prefill`) and a
+    different index mapping, so a prefill-only probe says nothing about the
+    tokens the model actually generates. Requires --enforce-eager: the syncs
+    here cannot run inside a captured decode graph.
+    """
+    lens = seq_lens.reshape(-1)
+    num_keys = int(lens[0].item())
+    row = logits[0]
+    selected = topk_indices[0]
+    for spec in _INDEXER_PROBE.split(","):
+        lo, hi = (int(v) for v in spec.split(":"))
+        band_hi = min(hi, num_keys)
+        if band_hi <= lo:
+            continue
+        best = row[lo:band_hi].max()
+        rank = int((row[:num_keys] > best).sum().item())
+        kept = int(((selected >= lo) & (selected < hi)).sum().item())
+        logger.info(
+            "indexer-probe-decode %s keys=%d band=[%d,%d) best_rank=%d kept=%d",
+            prefix,
+            num_keys,
+            lo,
+            hi,
+            rank,
+            kept,
+        )
+
+
+def _verify_sm70_decode_logits(prefix, logits, q, weights, kv_cache, block_table, seq_lens):
+    """In-situ parity of the SM70 decode logits against a torch reference.
+
+    Isolated kernel tests pass on synthetic tensors and still miss layout,
+    stride and block-table mistakes that only exist in the live engine, so
+    this re-derives row 0's scores straight from the paged cache with plain
+    torch ops and compares both the values and the induced top-512 set.
+    """
+    lens = seq_lens.reshape(-1)
+    n = int(lens[0].item())
+    if n < 2:
+        return
+    bs = kv_cache.shape[1]
+    idx = torch.arange(n, device=kv_cache.device)
+    # Block-major addressing, mirroring indexer_k_quant_and_cache: values for
+    # every token of the block, then that block's FP32 scales.
+    base = block_table[0][idx // bs].long() * kv_cache.stride(0)
+    pos = (idx % bs).long()
+    # NOT reshape(-1): MLAAttentionSpec pads the indexer page to 576 B
+    # (attention.py, alignment=576), so for block_size=64 the page is 8640 B
+    # against 64*132=8448 B of payload and the tensor is non-contiguous.
+    # reshape(-1) would quietly return a *compacted copy* while the offsets
+    # below still use the real 8640 B stride, drifting 192 B per block --
+    # which reads FP8 value bytes as the FP32 scale and manufactures negative
+    # ~1e36 scales and phantom e4m3 NaNs. as_strided keeps the padding.
+    flat = kv_cache.as_strided((kv_cache.shape[0] * kv_cache.stride(0),), (1,))
+    lane = torch.arange(128, device=kv_cache.device)
+    tokens = flat[(base + pos * 128)[:, None] + lane[None, :]]
+    k = tokens.contiguous().view(torch.float8_e4m3fn).float()
+    k_scale = (
+        flat[(base + bs * 128 + pos * 4)[:, None] + lane[None, :4]]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(-1)
+    )
+    qf = q[0].float()
+    wf = weights[0].float()
+    dot = qf @ k.t()
+    ref = ((dot * k_scale).relu() * wf[:, None]).sum(dim=0)
+    # The kernel hoists the per-key scale out past the relu, which is only
+    # valid for a positive scale. Scoring it both ways separates a scale-sign
+    # problem from an arithmetic one.
+    ref_hoisted = (dot.relu() * wf[:, None]).sum(dim=0) * k_scale
+
+    # The compressor writes a ue8m0 scale (`scale_val = tl.exp2(exponent)`), so
+    # every scale of a slot that was actually written is an exact power of two
+    # with a zero fp32 mantissa. Any other bit pattern means we are reading a
+    # slot the compressor never wrote — which is a different failure from a
+    # quantiser that overflows, and the two are easy to confuse because both
+    # surface as e4m3 NaN bytes.
+    sbits = k_scale.view(torch.int32)
+    written = (sbits & 0x007FFFFF == 0) & (k_scale > 0) & torch.isfinite(k_scale)
+    nan_byte = ((tokens == 0x7F) | (tokens == 0xFF)).any(dim=1)
+    zero_row = (tokens == 0).all(dim=1)
+    # If unwritten slots are the cause, "carries a NaN byte" and "scale is not
+    # a power of two" should pick out the same keys.
+    agree = int((nan_byte == ~written).sum().item())
+    bad = (~written).nonzero().flatten()
+    if bad.numel():
+        span = f"{int(bad[0])}..{int(bad[-1])}"
+        # Unwritten slots from a paging or boundary mistake cluster by position
+        # in the block; a quantiser bug would not.
+        resid = torch.bincount(bad % bs, minlength=bs)
+        hot = int(resid.argmax().item())
+        shape = f"span={span} distinct_resid={int((resid > 0).sum())}/{bs} hot_resid={hot}x{int(resid[hot])}"
+    else:
+        shape = "span=- "
+    logger.info(
+        "indexer-cache %s keys=%d shape=%s stride0=%d unwritten=%d(%.1f%%) "
+        "nanbyte_keys=%d zero_rows=%d nan_vs_unwritten_agree=%.1f%% %s",
+        prefix,
+        n,
+        tuple(kv_cache.shape),
+        kv_cache.stride(0),
+        int((~written).sum().item()),
+        100.0 * float((~written).sum().item()) / n,
+        int(nan_byte.sum().item()),
+        int(zero_row.sum().item()),
+        100.0 * agree / n,
+        shape,
+    )
+
+    got = logits[0][:n].float()
+    finite = torch.isfinite(got) & torch.isfinite(ref)
+    denom = ref[finite].abs().max().clamp_min(1e-9)
+    diff = (got - ref).abs().where(finite, torch.zeros_like(got))
+    err = (diff.max() / denom).item()
+    worst = int(diff.argmax().item())
+    k_top = min(512, n)
+    a = set(got.topk(k_top).indices.tolist())
+    b = set(ref.topk(k_top).indices.tolist())
+    c = set(ref_hoisted.topk(k_top).indices.tolist())
+    raw = tokens
+    logger.info(
+        "indexer-verify %s keys=%d rel_err=%.3e worst_at=%d(%.1f%%) "
+        "nan_got=%d nan_ref=%d big=%d top%d_overlap=%.1f%% "
+        "hoisted_overlap=%.1f%% | fp8nan=%d scale_neg=%d scale_bad=%d "
+        "scale_rng=[%.3g,%.3g] qnan=%d wnan=%d",
+        prefix,
+        n,
+        err,
+        worst,
+        100.0 * worst / n,
+        int((~torch.isfinite(got)).sum().item()),
+        int((~torch.isfinite(ref)).sum().item()),
+        int((diff > 0.01 * denom).sum().item()),
+        k_top,
+        100.0 * len(a & b) / k_top,
+        100.0 * len(a & c) / k_top,
+        int(((raw == 0x7F) | (raw == 0xFF)).sum().item()),
+        int((k_scale < 0).sum().item()),
+        int((~torch.isfinite(k_scale)).sum().item()),
+        k_scale[torch.isfinite(k_scale)].min().item(),
+        k_scale[torch.isfinite(k_scale)].max().item(),
+        int((~torch.isfinite(qf)).sum().item()),
+        int((~torch.isfinite(wf)).sum().item()),
     )
 
 
@@ -275,6 +464,15 @@ def sparse_attn_indexer(
                 topk_tokens,
             )
 
+            if _INDEXER_PROBE:
+                _log_indexer_probe_rank(
+                    k_cache_prefix,
+                    logits,
+                    topk_indices,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
@@ -357,6 +555,20 @@ def sparse_attn_indexer(
                 decode_metadata.block_table,
                 attn_metadata_narrowed.max_seq_len,
             )
+            if _INDEXER_PROBE:
+                _verify_sm70_decode_logits(
+                    k_cache_prefix,
+                    logits,
+                    padded_q_quant_decode_tokens.reshape(
+                        num_padded_tokens,
+                        padded_q_quant_decode_tokens.shape[-2],
+                        padded_q_quant_decode_tokens.shape[-1],
+                    ),
+                    padded_weights.reshape(num_padded_tokens, -1),
+                    raw_kv_cache,
+                    decode_metadata.block_table,
+                    seq_lens,
+                )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -410,6 +622,9 @@ def sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+
+        if _INDEXER_PROBE:
+            _log_indexer_probe_decode(k_cache_prefix, logits, topk_indices, seq_lens)
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
