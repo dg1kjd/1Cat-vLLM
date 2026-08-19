@@ -1543,6 +1543,13 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Optional per-request draft length, when the drafter shortens its own
+        # proposal (DSpark confidence truncation). Rides the draft-token copy
+        # stream with its own event.
+        self._draft_valid_counts: torch.Tensor | None = None
+        self._draft_valid_counts_pending = False
+        self.draft_valid_counts_cpu: torch.Tensor | None = None
+        self.draft_valid_counts_event: torch.cuda.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -1553,6 +1560,13 @@ class GPUModelRunner(
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
+            self.draft_valid_counts_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.draft_valid_counts_event = torch.cuda.Event()
             if self.use_async_scheduling:
                 self.valid_sampled_token_count_event = torch.Event()
                 self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
@@ -2019,15 +2033,29 @@ class GPUModelRunner(
         # Save scheduler-allocated spec lengths before trimming so
         # prev_num_draft_len keeps the optimistic count for rejection correction.
         original_num_spec_per_req: dict[str, int] = {}
+        trim_event: torch.cuda.Event | None = None
+        trim_counts_cpu: torch.Tensor | None = None
         if (
             self.speculative_config is not None
             and self.speculative_config.use_ngram_gpu()
         ):
+            trim_event = self._num_valid_draft_tokens_event
+            trim_counts_cpu = self._num_valid_draft_tokens_cpu
+        elif self._draft_valid_counts_pending:
+            # The drafter shortened its own proposal (DSpark confidence
+            # truncation). Under async scheduling the scheduler committed a
+            # full-width block before the drafter had even run, so this is the
+            # only place the shorter block can take effect — same reason the
+            # ngram GPU path trims here.
+            trim_event = self.draft_valid_counts_event
+            trim_counts_cpu = self.draft_valid_counts_cpu
+            self._draft_valid_counts_pending = False
+        if trim_event is not None and trim_counts_cpu is not None:
             for req_id, toks in scheduled_spec_tokens.items():
                 original_num_spec_per_req[req_id] = len(toks)
             update_scheduler_for_invalid_drafts(
-                self._num_valid_draft_tokens_event,
-                self._num_valid_draft_tokens_cpu,
+                trim_event,
+                trim_counts_cpu,
                 scheduler_output,
                 self.input_batch.req_id_to_index,
             )
@@ -6378,6 +6406,7 @@ class GPUModelRunner(
         self._draft_prob_token_ids = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
+        self._draft_valid_counts = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -6778,6 +6807,8 @@ class GPUModelRunner(
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
+                self._draft_valid_counts = None
+                self._draft_valid_counts_pending = False
             self.draft_token_ids_event.record()
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
@@ -6795,7 +6826,25 @@ class GPUModelRunner(
             self.draft_token_ids_event,
             "GPUModelRunner.draft_token_ids_event.synchronize",
         )
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        rows = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        if self._draft_valid_counts_pending:
+            # The drafter shortened its own proposal. Truncation is always a
+            # prefix, so the scheduler simply sees a shorter draft; the
+            # rejection sampler and draft-prob alignment both already slice to
+            # the scheduled length.
+            #
+            # This is the *synchronous*-scheduling route. Under async
+            # scheduling the scheduler has already committed a full-width
+            # block by the time we get here and never reads this list, so the
+            # trim has to happen again in _update_states — see
+            # update_scheduler_for_invalid_drafts there. The two are
+            # idempotent: that one clamps to the already-scheduled length.
+            assert self.draft_valid_counts_cpu is not None
+            assert self.draft_valid_counts_event is not None
+            self.draft_valid_counts_event.synchronize()
+            counts = self.draft_valid_counts_cpu[: len(req_ids)].tolist()
+            rows = [row[:count] for row, count in zip(rows, counts)]
+        return rows, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -6865,6 +6914,7 @@ class GPUModelRunner(
         self._draft_prob_token_ids = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
+        self._draft_valid_counts = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -7167,6 +7217,22 @@ class GPUModelRunner(
                         "next_token_ids": next_token_ids,
                     },
                 )
+            if hasattr(self.drafter, "take_last_valid_draft_counts"):
+                self._draft_valid_counts = (
+                    self.drafter.take_last_valid_draft_counts()
+                )
+                if self._draft_valid_counts is not None:
+                    assert self.draft_valid_counts_cpu is not None
+                    assert self.draft_valid_counts_event is not None
+                    assert self.draft_token_ids_copy_stream is not None
+                    copy_num_valid_draft_tokens(
+                        self.draft_valid_counts_cpu,
+                        self.draft_token_ids_copy_stream,
+                        self.draft_valid_counts_event,
+                        self._draft_valid_counts,
+                        self.input_batch.num_reqs,
+                    )
+                    self._draft_valid_counts_pending = True
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
