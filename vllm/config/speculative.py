@@ -52,7 +52,7 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
+DFlashModelTypes = Literal["dflash", "dflash_ddtree", "dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -765,7 +765,12 @@ class SpeculativeConfig:
                     ):
                         pass
                     else:
-                        eagle_method = "dflash" if self.use_dflash() else self.method
+                        if self.method == "dspark":
+                            eagle_method = "dspark"
+                        elif self.use_dflash():
+                            eagle_method = "dflash"
+                        else:
+                            eagle_method = self.method
                         eagle_config = EAGLEConfig(
                             self.draft_model_config.hf_config,
                             method=eagle_method,
@@ -773,6 +778,9 @@ class SpeculativeConfig:
                         )
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
+
+                if self.method == "dspark":
+                    self._configure_dspark_draft()
 
                 if self.use_dflash():
                     self.parallel_drafting = True
@@ -1108,6 +1116,50 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method in get_args(DFlashModelTypes)
+
+    def _configure_dspark_draft(self) -> None:
+        """Derive the DFlash-shaped draft config from the DSV4 checkpoint.
+
+        DSpark ships inside the target checkpoint and describes itself in
+        config.json (``dspark_block_size``, ``dspark_noise_token_id``,
+        ``dspark_target_layer_ids``), so none of this needs to be passed on the
+        command line. It is translated into the keys the DFlash proposer reads.
+        """
+        hf_config = self.draft_model_config.hf_config
+
+        block_size = getattr(hf_config, "dspark_block_size", None)
+        noise_token_id = getattr(hf_config, "dspark_noise_token_id", None)
+        target_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+        if not block_size or noise_token_id is None or not target_layer_ids:
+            raise ValueError(
+                "method='dspark' requires a checkpoint whose config.json "
+                "declares dspark_block_size, dspark_noise_token_id and "
+                "dspark_target_layer_ids. This checkpoint declares "
+                f"block_size={block_size!r}, noise_token_id={noise_token_id!r}, "
+                f"target_layer_ids={target_layer_ids!r}."
+            )
+
+        hf_config.dflash_config = {
+            "mask_token_id": noise_token_id,
+            # Every slot in the draft block attends to every other slot; the
+            # reference builds one shared index list for all block queries
+            # (get_dspark_topk_idxs), i.e. non-causal within the block.
+            "causal": False,
+            "use_aux_hidden_state": True,
+        }
+        hf_config.eagle_aux_hidden_state_layer_ids = list(target_layer_ids)
+
+        # One drafter forward emits `block_size` slots: slot 0 re-predicts the
+        # token we already have, so block_size - 1 are genuinely speculative.
+        max_spec = block_size - 1
+        if self.num_speculative_tokens is None:
+            self.num_speculative_tokens = max_spec
+        elif self.num_speculative_tokens > max_spec:
+            raise ValueError(
+                f"num_speculative_tokens={self.num_speculative_tokens} exceeds "
+                f"what DSpark can propose in one pass (dspark_block_size="
+                f"{block_size} gives at most {max_spec})."
+            )
 
     def use_dflash_ddtree(self) -> bool:
         return self.method == "dflash_ddtree"

@@ -947,7 +947,7 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         return (
             spec_config is not None
-            and spec_config.method == "mtp"
+            and spec_config.method in ("mtp", "dflash", "dflash_ddtree", "dspark")
             and self.device.type == "cuda"
             and _sm70_mtp_profile_env_enabled()
         )
@@ -1240,7 +1240,14 @@ class GPUModelRunner(
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                if self.speculative_config.method == "dspark":
+                    from vllm.v1.spec_decode.dspark import DSparkProposer
+
+                    self.drafter = DSparkProposer(
+                        self.vllm_config, self.device, self
+                    )
+                else:
+                    self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = (
                     self.drafter.eagle3_use_aux_hidden_state
                     and not envs.VLLM_DFLASH_DISABLE_AUX_OUTPUTS

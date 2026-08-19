@@ -541,6 +541,64 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # ([num_tokens, padded_heads, head_dim]).
         self.mla_attn(q, kv, positions, output=out)
 
+    def kv_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project a hidden state straight to this layer's normed KV latent.
+
+        The DSpark drafter needs K/V derived from the *target's* hidden states
+        (its `main_x`), with no query side at all, so this takes the kv half of
+        the fused wqa/wkv GEMM and applies kv_norm on its own. Numerically the
+        same as the kv half of `fused_q_kv_rmsnorm` in `attention_impl`.
+        """
+        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        _, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        return self.kv_norm(kv.contiguous())
+
+    def insert_kv_into_swa_cache(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
+    ) -> None:
+        """RoPE + FP8 quantize + paged insert for externally-computed KV.
+
+        `slot_mapping` None means a dummy/profile run: the caller still wants
+        the projection cost, but nothing may be written to the cache.
+        """
+        if slot_mapping is None:
+            return
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        block_size = self.swa_cache_layer.block_size
+
+        if self._use_sm70_path:
+            from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
+                sm70_kv_rope_fp8_insert,
+            )
+
+            sm70_kv_rope_fp8_insert(
+                kv,
+                swa_kv_cache,
+                slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                block_size,
+            )
+            return
+
+        # Non-SM70: reuse the fused op with an empty query so only the KV side
+        # does work (it norms/ropes q per head; zero heads means none).
+        empty_q = kv.new_empty((kv.shape[0], 0, self.head_dim))
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            empty_q,
+            kv,
+            swa_kv_cache.view(swa_kv_cache.shape[0], -1),
+            slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            0,
+            self.eps,
+            block_size,
+        )
+
     def _fused_qnorm_rope_kv_insert(
         self,
         q: torch.Tensor,

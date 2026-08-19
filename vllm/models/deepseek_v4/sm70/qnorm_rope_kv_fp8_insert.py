@@ -131,3 +131,47 @@ def sm70_qnorm_rope_kv_fp8_insert(
         block_size=block_size,
     )
     return q
+
+
+def sm70_kv_rope_fp8_insert(
+    kv: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    block_size: int,
+) -> None:
+    """KV-only half of the transform above: RoPE, quantize, page in.
+
+    Used by the DSpark drafter, whose *context* keys come from the target's
+    hidden states rather than from its own queries, so there is no Q to norm.
+    Launching the shared kernel with ``num_heads=0`` selects the kv branch on
+    every program and never dereferences ``q_ptr``.
+    """
+    assert kv.ndim == 2 and kv.shape[-1] == _HEAD_DIM
+    assert kv.dtype in (torch.float16, torch.bfloat16)
+    kv = kv.contiguous()
+
+    num_tokens = kv.shape[0]
+    kv_roped = torch.empty_like(kv)
+    _sm70_qnorm_rope_kernel[(num_tokens, 1)](
+        kv,  # unused when num_heads == 0
+        kv,
+        kv_roped,
+        positions,
+        cos_sin_cache,
+        0.0,
+        num_tokens,
+        num_heads=0,
+        HEAD_DIM=_HEAD_DIM,
+        ROPE_DIM=_ROPE_DIM,
+        NOPE_DIM=_NOPE_DIM,
+        HALF_ROPE=_HALF_ROPE,
+        num_warps=4,
+    )
+    quantize_and_insert_k_cache(
+        kv_roped,
+        swa_kv_cache.view(swa_kv_cache.shape[0], -1),
+        slot_mapping,
+        block_size=block_size,
+    )

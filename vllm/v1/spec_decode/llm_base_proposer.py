@@ -181,14 +181,24 @@ class SpecDecodeBaseProposer:
         self.hidden_size = self.draft_model_config.get_hidden_size()
         self.inputs_embeds_size = self.draft_model_config.get_inputs_embeds_size()
 
-        # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
-        # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
-        # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
+        # DeepSeek V4 drafters take a wider hidden state than one hidden_size,
+        # but the two V4 drafters differ in what they take:
+        #   * V3-style MTP consumes the target's pre-hc_head residual stream,
+        #     (T, hc_mult * hidden_size);
+        #   * DSpark consumes the concatenated per-layer hidden states of
+        #     dspark_target_layer_ids, (T, len(target_layer_ids) * hidden_size),
+        #     which it then folds down with its own main_proj.
         draft_hf_config = self.draft_model_config.hf_config
         if hasattr(draft_hf_config, "compress_ratios") and hasattr(
             draft_hf_config, "hc_mult"
         ):
-            self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
+            dspark_target_layer_ids = getattr(
+                draft_hf_config, "dspark_target_layer_ids", None
+            )
+            if self.speculative_config.method == "dspark" and dspark_target_layer_ids:
+                self.hidden_size = self.hidden_size * len(dspark_target_layer_ids)
+            else:
+                self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
         # Unifying eagle, draft model, and parallel drafting support.
         # DFlash always uses parallel drafting (all tokens in one pass),
@@ -1490,7 +1500,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash", "dflash_ddtree")
+        return self.method not in (
+            "mtp",
+            "draft_model",
+            "dflash",
+            "dflash_ddtree",
+            "dspark",
+        )
 
     def prepare_next_token_ids_cpu(
         self,

@@ -42,7 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -1053,6 +1053,11 @@ class DeepseekV4Model(nn.Module):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
+        # Layers whose per-layer hidden state is exported for a drafter
+        # (EAGLE3 / DFlash / DSpark). Set by set_aux_hidden_state_layers();
+        # empty means forward() returns the hidden states alone.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
         spec_config = vllm_config.speculative_config
         needs_mtp_hidden_states = spec_config is not None and (
             spec_config.use_eagle() or spec_config.uses_draft_model()
@@ -1106,8 +1111,11 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        aux_hidden_states: list[torch.Tensor] = []
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer), self.start_layer
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1116,6 +1124,19 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if layer_idx in self.aux_hidden_state_layers:
+                # vLLM fuses layer i's mHC *post* with layer i+1's *pre*
+                # (mhc_fused_post_pre_tilelang), so the per-layer hidden state
+                # the DSpark drafter wants is never materialised on its own.
+                # Undo just that fusion here: mhc_post_tilelang allocates its
+                # own output and does not touch its inputs, so the main stack
+                # is unaffected. Mean over the hc_mult axis matches the
+                # reference `h.mean(dim=2)` (inference/model.py:920).
+                aux_hidden_states.append(
+                    mhc_post_tilelang(
+                        hidden_states, residual, post_mix, res_mix
+                    ).mean(dim=1)
+                )
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
@@ -1137,6 +1158,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1306,7 +1329,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1369,6 +1392,19 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return hidden_states
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """DSpark fixes its target layers in config.json
+        (``dspark_target_layer_ids``: [40, 41, 42]); fall back to the usual
+        low/mid/late triple only if the checkpoint does not say."""
+        target_ids = getattr(self.config, "dspark_target_layer_ids", None)
+        if target_ids:
+            return tuple(target_ids)
+        num_layers = self.config.num_hidden_layers
+        return (2, num_layers // 2, num_layers - 3)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,

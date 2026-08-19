@@ -111,6 +111,14 @@ class DeepseekSparseSWABackend(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         return [512]
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # Attention here is driven by an explicit per-token slot-index list
+        # rather than a triangular mask, so making a query block bidirectional
+        # is just a matter of which slots that list contains. The DSpark
+        # drafter needs it: all block_size slots attend to each other.
+        return True
+
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
         if current_platform.is_rocm():
@@ -157,8 +165,13 @@ class DeepseekSparseSWAMetadata:
 
     is_valid_token: torch.Tensor | None = None  # [num_tokens]
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
-    decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, window_size]
+    decode_swa_indices: torch.Tensor | None = None  # [num_decode_tokens, index_width]
     decode_swa_lens: torch.Tensor | None = None  # [num_decode_tokens]
+
+    # False when every query token of a request attends to the whole query
+    # block as well as the context window (the DSpark draft block). Checked by
+    # the DFlash proposer, which refuses to run on a causal backend.
+    causal: bool = True
 
     # Number of decode/prefill requests/tokens (batch is reordered: decodes first)
     num_decodes: int = 0
@@ -289,10 +302,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         # With MTP, decode can have query_len up to 1 + num_speculative_tokens.
         # Must match the threshold used by the indexer and flashmla_sparse so
-        # that all backends agree on the decode/prefill split.
-        self.decode_threshold = (
-            self.reorder_batch_threshold + self.num_speculative_tokens
-        )
+        # that all backends agree on the decode/prefill split. Parallel
+        # drafting (DFlash/DSpark) doubles the bound the same way
+        # `_init_reorder_batch_threshold` does; without the factor this builder
+        # calls a 6..9-token batch a prefill while flashmla_sparse calls it a
+        # decode, and the C128A prefill top-k is then never built
+        # (`assert topk_indices is not None` in sm70/sparse.py).
+        self.decode_threshold = self.reorder_batch_threshold + (
+            2
+            if (
+                self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.parallel_drafting
+            )
+            else 1
+        ) * self.num_speculative_tokens
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -312,10 +335,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # A non-causal query block (the DSpark drafter) needs room for the
+        # context window *plus* the whole block, since every block slot attends
+        # to every other one: window_size + (1 + num_speculative_tokens).
+        # Causality is a per-build property of CommonAttentionMetadata, not of
+        # the builder, so allocate for the worst case and slice per build --
+        # the causal path must keep seeing exactly window_size or the SWA
+        # kernel pays an extra BLOCK_K chunk per token for nothing.
+        self.swa_index_capacity = self.window_size + (
+            self.decode_threshold if self.num_speculative_tokens else 0
+        )
         self.decode_swa_indices = torch.zeros(
             max_tokens,
             1,
-            self.window_size,
+            self.swa_index_capacity,
             dtype=torch.int32,
             device=self.device,
         )
@@ -367,11 +400,17 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)
 
+        # Causal builds must keep the index list exactly window_size wide; the
+        # non-causal draft block also needs its sibling slots.
+        non_causal = not common_attn_metadata.causal
+        index_width = self.swa_index_capacity if non_causal else self.window_size
+        swa_indices = self.decode_swa_indices[..., :index_width]
+
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
             _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                self.decode_swa_indices,
-                self.decode_swa_indices.stride(0),
+                swa_indices,
+                swa_indices.stride(0),
                 self.decode_swa_lens,
                 self.window_size,
                 query_start_loc,
@@ -382,6 +421,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table.stride(0),
                 self.block_size,
                 TRITON_BLOCK_SIZE=1024,
+                INDEX_WIDTH=index_width,
+                NON_CAUSAL=non_causal,
             )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
@@ -408,9 +449,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping=slot_mapping,
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
-            decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
+            decode_swa_indices=swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             block_size=self.block_size,
+            causal=common_attn_metadata.causal,
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
@@ -548,6 +590,8 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_stride,
     block_size,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    INDEX_WIDTH: tl.constexpr,
+    NON_CAUSAL: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     is_valid = tl.load(is_valid_token_ptr + token_idx)
@@ -564,14 +608,23 @@ def _compute_swa_indices_and_lens_kernel(
     seq_len = tl.load(seq_lens_ptr + req_idx)
     prefix_len = seq_len - query_len
 
-    pos = prefix_len + token_idx - query_start
-    start_pos = tl.maximum(pos - window_size + 1, 0)
-    end_pos = pos + 1
+    if NON_CAUSAL:
+        # Every token of the query block sees the same keys: the context
+        # window ending at the last committed token, plus the entire block.
+        # This is the paged form of the reference's get_dspark_topk_idxs,
+        # which builds one index list and broadcasts it over all block_size
+        # queries (inference/model.py:745).
+        start_pos = tl.maximum(prefix_len - window_size, 0)
+        end_pos = prefix_len + query_len
+    else:
+        pos = prefix_len + token_idx - query_start
+        start_pos = tl.maximum(pos - window_size + 1, 0)
+        end_pos = pos + 1
 
     swa_len = end_pos - start_pos
     tl.store(swa_lens_ptr + token_idx, swa_len)
 
-    for i in range(0, window_size, TRITON_BLOCK_SIZE):
+    for i in range(0, INDEX_WIDTH, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
 
         pos_offset = start_pos + offset
@@ -587,5 +640,5 @@ def _compute_swa_indices_and_lens_kernel(
         tl.store(
             swa_indices_ptr + token_idx * swa_indices_stride + offset,
             slot_ids,
-            mask=offset < window_size,
+            mask=offset < INDEX_WIDTH,
         )

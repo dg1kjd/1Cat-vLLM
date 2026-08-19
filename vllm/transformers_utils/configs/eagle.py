@@ -72,10 +72,15 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
+        elif method == "dspark":
+            # DSpark's drafter is a fixed module shipped inside the DSV4
+            # checkpoint (mtp.0/1/2), not a per-target-arch derivation, so the
+            # architecture is named outright rather than prefixed.
+            kwargs["architectures"] = ["DeepSeekV4DSparkModel"]
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, and dflash."
+                "eagle, eagle3, dflash, and dspark."
             )
 
         super().__init__(**kwargs)

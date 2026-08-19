@@ -17,13 +17,18 @@ from .quant_config import DeepseekV4FP8Config
 # default that mypy sees; the ROCm branch overrides it at runtime and is
 # kept type-compatible via ``# type: ignore[assignment]``.
 if TYPE_CHECKING or not current_platform.is_rocm():
+    from .nvidia.dspark import DeepSeekV4DSpark
     from .nvidia.model import DeepseekV4ForCausalLM
     from .nvidia.mtp import DeepSeekV4MTP
 else:
     from .amd.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 
+    # DSpark is NVIDIA-only for now; the ROCm branch has no equivalent.
+    DeepSeekV4DSpark = None  # type: ignore[assignment,misc]
+
 __all__ = [
+    "DeepSeekV4DSpark",
     "DeepSeekV4MTP",
     "DeepseekV4FP8Config",
     "DeepseekV4ForCausalLM",

@@ -266,7 +266,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         next_n = self.num_speculative_tokens + 1
-        self.reorder_batch_threshold += self.num_speculative_tokens
+        # Same bound as `_init_reorder_batch_threshold`: parallel drafting can
+        # put 1 + 2 * num_speculative_tokens queries in a decode batch, and all
+        # DSV4 backends must agree on the decode/prefill split.
+        self.reorder_batch_threshold += (
+            2
+            if (
+                self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.parallel_drafting
+            )
+            else 1
+        ) * self.num_speculative_tokens
         # NOTE(zyongye) fp4 indexer cache only natively supports next_n in
         # natively_supported_next_n_fp4; for other next_n values we fall back
         # to the flattening path. Outside the SM100 datacenter family the FP8
