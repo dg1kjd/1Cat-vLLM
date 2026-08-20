@@ -73,7 +73,11 @@ def _sm70_qnorm_rope_kernel(
         kv_base = kv_ptr + token_idx * HEAD_DIM
         kv_out_base = kv_out_ptr + token_idx * HEAD_DIM
         offsets = tl.arange(0, HEAD_DIM)
-        tl.store(kv_out_base + offsets, tl.load(kv_base + offsets))
+        tl.store(
+            kv_out_base + offsets,
+            tl.load(kv_base + offsets, mask=offsets < NOPE_DIM),
+            mask=offsets < NOPE_DIM,
+        )
 
         even_offsets = NOPE_DIM + pair_idx * 2
         odd_offsets = even_offsets + 1
