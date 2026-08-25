@@ -135,6 +135,8 @@ class AnthropicServingMessages(OpenAIServingChat):
 
         cls._convert_system_message(anthropic_request, openai_messages)
         cls._convert_messages(anthropic_request.messages, openai_messages)
+        cls._merge_consecutive_user_messages(openai_messages)
+        cls._strip_volatile_messages(openai_messages)
         req = cls._build_base_request(anthropic_request, openai_messages)
         cls._handle_streaming_options(req, anthropic_request)
         cls._handle_output_config(req, anthropic_request)
@@ -164,21 +166,71 @@ class AnthropicServingMessages(OpenAIServingChat):
                             continue
                         system_parts.append(block.text)
 
-        # System messages embedded inside the messages array
-        for msg in anthropic_request.messages:
-            if msg.role != "system":
-                continue
-            if isinstance(msg.content, str):
-                system_parts.append(msg.content)
-            else:
-                for block in msg.content:
-                    if block.type == "text" and block.text:
-                        if block.text.startswith("x-anthropic-billing-header"):
-                            continue
-                        system_parts.append(block.text)
+        # System turns embedded inside the messages array are NOT hoisted here.
+        # Clients such as Claude Code append a conversation-level system turn on
+        # every request (budget/context reminders). Merging those into the
+        # leading system block rewrites the rendered head each turn, so the
+        # very first block changes and the whole prefix cache is invalidated.
+        # They are re-roled to `user` in place by _convert_messages instead,
+        # which keeps rendering append-only. See vllm-project/vllm#53393.
+        # VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM=1 restores the old behaviour.
+        if envs.VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM:
+            for msg in anthropic_request.messages:
+                if msg.role != "system":
+                    continue
+                if isinstance(msg.content, str):
+                    system_parts.append(msg.content)
+                else:
+                    for block in msg.content:
+                        if block.type == "text" and block.text:
+                            if block.text.startswith("x-anthropic-billing-header"):
+                                continue
+                            system_parts.append(block.text)
 
         if system_parts:
             openai_messages.append({"role": "system", "content": "".join(system_parts)})
+
+    @classmethod
+    def _merge_consecutive_user_messages(
+        cls, openai_messages: list[dict[str, Any]]
+    ) -> None:
+        """Fold adjacent ``user`` turns into one, preserving alternation.
+
+        Re-roling an inline system turn to ``user`` can leave two user turns
+        back to back, which many chat templates reject. Merging them keeps the
+        strict user/assistant alternation templates expect while leaving the
+        rendered text append-only. Only touches messages that carry no
+        ``tool_calls``; tool and assistant turns are never merged.
+        """
+        if envs.VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM:
+            return
+
+        def _as_parts(content: Any) -> list[dict[str, Any]]:
+            if isinstance(content, str):
+                return [{"type": "text", "text": content}]
+            return list(content) if isinstance(content, list) else []
+
+        i = 1
+        while i < len(openai_messages):
+            prev, cur = openai_messages[i - 1], openai_messages[i]
+            mergeable = (
+                prev.get("role") == "user"
+                and cur.get("role") == "user"
+                and not prev.get("tool_calls")
+                and not cur.get("tool_calls")
+            )
+            if not mergeable:
+                i += 1
+                continue
+            if isinstance(prev.get("content"), str) and isinstance(
+                cur.get("content"), str
+            ):
+                prev["content"] = f"{prev['content']}\n{cur['content']}"
+            else:
+                prev["content"] = _as_parts(prev.get("content")) + _as_parts(
+                    cur.get("content")
+                )
+            del openai_messages[i]
 
     @classmethod
     def _strip_volatile_context(cls, text: str) -> str:
@@ -203,13 +255,42 @@ class AnthropicServingMessages(OpenAIServingChat):
         return _TOTAL_TOKENS_RE.sub("", text)
 
     @classmethod
+    def _strip_volatile_messages(cls, openai_messages: list[dict[str, Any]]) -> None:
+        """Apply :meth:`_strip_volatile_context` to every converted message.
+
+        Done as one pass over the finished message list rather than at each
+        conversion site: the tag also arrives inside ``tool_result`` content,
+        which reaches the prompt through its own code paths. A single choke
+        point here covers system text, plain and block message content, and
+        tool results alike.
+        """
+        if envs.VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT:
+            return
+        for msg in openai_messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = cls._strip_volatile_context(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["text"] = cls._strip_volatile_context(part.get("text", ""))
+
+    @classmethod
     def _convert_messages(
         cls, messages: list, openai_messages: list[dict[str, Any]]
     ) -> None:
         """Convert Anthropic messages to OpenAI format"""
         for msg in messages:
             if msg.role == "system":
-                continue
+                if envs.VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM:
+                    # Already folded into the leading system block.
+                    continue
+                # Re-role in place, content unchanged, so the rendered prefix
+                # stays append-only across turns (vllm-project/vllm#53393).
+                # Emitting a literal `system` turn mid-conversation is not an
+                # option: many chat templates reject it, and DeepSeek-V4 style
+                # templates garble their output when they see one.
+                msg.role = "user"  # type: ignore[assignment]
 
             openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
 

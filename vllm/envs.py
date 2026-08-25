@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT: bool = False
+    VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM: bool = False
     VLLM_SM70_QWEN3_NEXT_FP16_GUARD: bool = True
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -1778,6 +1779,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # body instead of stripping it. The value changes on every request, so
     # keeping it prevents prefix-cache reuse from that point onward. Set 1 only
     # to reproduce the unstripped behaviour.
+    # Fold conversation-level system turns into the leading system block
+    # (the pre-#53393 behaviour). Clients that append a system turn per
+    # request then rewrite the rendered head every turn, destroying prefix
+    # reuse. Default 0: re-role them to `user` in place instead.
+    "VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM": lambda: bool(
+        int(os.getenv("VLLM_ANTHROPIC_HOIST_INLINE_SYSTEM", "0"))
+    ),
     "VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT", "0"))
     ),
