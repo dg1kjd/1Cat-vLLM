@@ -7,6 +7,7 @@
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
@@ -50,6 +52,10 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = logging.getLogger(__name__)
+
+# Claude Code embeds a running context budget in the prompt body; its value
+# changes every request, so it breaks prefix reuse from that point onward.
+_TOTAL_TOKENS_RE = re.compile(r"<total_tokens>.*?</total_tokens>", re.DOTALL)
 
 
 def wrap_data_with_event(data: str, event: str):
@@ -175,6 +181,28 @@ class AnthropicServingMessages(OpenAIServingChat):
             openai_messages.append({"role": "system", "content": "".join(system_parts)})
 
     @classmethod
+    def _strip_volatile_context(cls, text: str) -> str:
+        """Drop per-request harness bookkeeping that defeats prefix caching.
+
+        Claude Code embeds a running context budget of the form
+        ``<total_tokens>14983826 tokens left</total_tokens>`` in the prompt.
+        Its value changes on every request, so once it appears the token
+        sequence diverges and no block from that point on can be reused --
+        the same reason the ``x-anthropic-billing-header`` block is dropped
+        above. Measured on a 16k prompt: 77.3% hit with the counter present
+        and varying, 99.4% with it absent.
+
+        The tag is display-only bookkeeping about the client's own budget, so
+        removing it does not change what the model is asked to do. Disable
+        with ``VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT=1``.
+        """
+        if not text or "<total_tokens>" not in text:
+            return text
+        if envs.VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT:
+            return text
+        return _TOTAL_TOKENS_RE.sub("", text)
+
+    @classmethod
     def _convert_messages(
         cls, messages: list, openai_messages: list[dict[str, Any]]
     ) -> None:
@@ -186,7 +214,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
 
             if isinstance(msg.content, str):
-                openai_msg["content"] = msg.content
+                openai_msg["content"] = cls._strip_volatile_context(msg.content)
             else:
                 cls._convert_message_content(msg, openai_msg, openai_messages)
 
@@ -241,7 +269,9 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> None:
         """Convert individual content block"""
         if block.type == "text" and block.text:
-            content_parts.append({"type": "text", "text": block.text})
+            content_parts.append(
+                {"type": "text", "text": cls._strip_volatile_context(block.text)}
+            )
         elif block.type == "image" and block.source:
             image_url = cls._convert_image_source_to_url(block.source)
             content_parts.append({"type": "image_url", "image_url": {"url": image_url}})

@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
+    VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT: bool = False
     VLLM_SM70_QWEN3_NEXT_FP16_GUARD: bool = True
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -1772,6 +1773,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Warm up the accepted SM70 AWQ dense / dense-stage / active-expert
     # TurboMind routes before CUDA graph capture. This does not enable the old
     # compact AWQ MoE experiments.
+    # Keep per-request harness bookkeeping (e.g. Claude Code's
+    # "<total_tokens>N tokens left</total_tokens>" context budget) in the prompt
+    # body instead of stripping it. The value changes on every request, so
+    # keeping it prevents prefix-cache reuse from that point onward. Set 1 only
+    # to reproduce the unstripped behaviour.
+    "VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT": lambda: bool(
+        int(os.getenv("VLLM_ANTHROPIC_KEEP_VOLATILE_CONTEXT", "0"))
+    ),
     # Saturate non-finite fp16 sublayer outputs in Qwen3-Next before they enter
     # the residual stream. SM70 has no bf16, so this bf16-native model runs in
     # fp16, where a few "massive activation" channels exceed the fp16 max and
