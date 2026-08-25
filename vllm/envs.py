@@ -231,6 +231,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL: bool = False
     VLLM_SM70_UNQUANT_DEBUG: bool = False
+    VLLM_SM70_SHARED_GATE_FIRST: bool = True
     VLLM_SM70_SHARED_GATE_MAX_M: int = 64
     VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
     VLLM_SM70_FP8_TURBOMIND: bool = True
@@ -2036,6 +2037,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_UNQUANT_DEBUG": lambda: bool(
         int(os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0"))
+    ),
+    # On fp16, apply the shared-expert sigmoid gate to the intermediate
+    # activation instead of to the down_proj output. Identical math, but
+    # down_proj then computes at the gated scale so its per-rank fp16 partials
+    # stay inside the fp16 range. Set 0 to restore the gate-after ordering.
+    "VLLM_SM70_SHARED_GATE_FIRST": lambda: bool(
+        int(os.getenv("VLLM_SM70_SHARED_GATE_FIRST", "1"))
     ),
     "VLLM_SM70_SHARED_GATE_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64")
