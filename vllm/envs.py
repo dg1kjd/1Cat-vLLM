@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
+    VLLM_SM70_QWEN3_NEXT_FP16_GUARD: bool = True
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
     VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS: int = 8
@@ -1770,6 +1771,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Warm up the accepted SM70 AWQ dense / dense-stage / active-expert
     # TurboMind routes before CUDA graph capture. This does not enable the old
     # compact AWQ MoE experiments.
+    # Saturate non-finite fp16 sublayer outputs in Qwen3-Next before they enter
+    # the residual stream. SM70 has no bf16, so this bf16-native model runs in
+    # fp16, where a few "massive activation" channels exceed the fp16 max and
+    # become +/-inf; the next RMSNorm then reduces over that inf and yields NaN
+    # for every hidden dim. Set 0 to reproduce the unguarded behaviour.
+    "VLLM_SM70_QWEN3_NEXT_FP16_GUARD": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN3_NEXT_FP16_GUARD", "1"))
+    ),
     "VLLM_SM70_AWQ_WARMUP": lambda: bool(int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))),
     "VLLM_SM70_AWQ_WARMUP_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")

@@ -313,6 +313,29 @@ def _sm70_dump_qwen_layer_tensor(
     return tensor
 
 
+# On SM70 (V100) there is no bf16, so this bf16-native model runs in fp16.
+# A few "massive activation" channels exceed the fp16 max (65504) in the
+# attention / MoE sublayer outputs, producing +/-inf. The very next RMSNorm
+# reduces over that inf and yields NaN, which then spreads to every hidden
+# dim and cascades through all later layers -> all-NaN logits -> garbage.
+# Saturating each fp16 sublayer contribution back into the finite fp16 range
+# before it enters the residual stream keeps the network finite. This does not
+# change semantics: that channel is renormalized by the next RMSNorm whether it
+# is 65504 or its true (larger) value. Default on; only acts on fp16 tensors.
+_FP16_MAX = 65504.0
+
+
+def _sm70_fp16_saturate(t: torch.Tensor) -> torch.Tensor:
+    """Clamp non-finite fp16 activations into the finite fp16 range.
+
+    No-op for non-fp16 dtypes and when the guard is disabled. Pure elementwise
+    (``nan_to_num``), so it is safe to capture under CUDA graphs / torch.compile.
+    """
+    if not envs.VLLM_SM70_QWEN3_NEXT_FP16_GUARD or t.dtype != torch.float16:
+        return t
+    return torch.nan_to_num(t, nan=0.0, posinf=_FP16_MAX, neginf=-_FP16_MAX)
+
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -774,6 +797,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = projected_attention_output
         else:
             hidden_states = self_attention_output
+        hidden_states = _sm70_fp16_saturate(hidden_states)
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "attn_out",
             self.layer_idx,
@@ -805,7 +829,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             self.layer_type,
             residual,
         )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = _sm70_fp16_saturate(self.mlp(hidden_states))
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "mlp_out",
             self.layer_idx,
