@@ -265,6 +265,26 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
+        # Decode threshold used for the C128A metadata below. It must equal the
+        # one DeepseekSparseSWA uses, because DeepseekV4's forward_mqa takes the
+        # decode/prefill split (and the `q` slice offsets) from the SWA metadata
+        # while consuming the C128A tensors built here.
+        #
+        # _init_reorder_batch_threshold() cannot be used for that: for a
+        # parallel-drafting proposer such as DSpark it returns
+        # 1 + 2 * num_speculative_tokens, whereas SWA and the indexer both use
+        # 1 + num_speculative_tokens. A query of length in between is then a
+        # prefill to SWA but a decode here, so `c128a_prefill_topk_indices` is
+        # never populated and _forward_prefill trips
+        # `assert topk_indices is not None`.
+        spec_config = vllm_config.speculative_config
+        self.c128a_decode_threshold = 1 + (
+            spec_config.num_speculative_tokens
+            if spec_config is not None
+            and spec_config.num_speculative_tokens is not None
+            else 0
+        )
+
         sm_count = num_compute_units(device.index)
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
@@ -631,14 +651,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         req_id_per_token: torch.Tensor,
     ) -> dict[str, torch.Tensor | None]:
         """Pre-compute C128A topk indices for DeepseekV4 (compress_ratio >= 128)."""
-        # Must match SWA's decode split (no `require_uniform=True`) so
+        # Must match SWA's decode split -- both the absence of
+        # `require_uniform=True` and the threshold itself -- so that
         # `c128a_global_decode_topk_indices.shape[0]` lines up with q in
-        # `_forward_decode`. The per-token C128A kernel handles non-uniform
-        # query lengths.
+        # `_forward_decode`, and so that a query SWA treats as a prefill also
+        # produces `c128a_prefill_topk_indices` here. The per-token C128A kernel
+        # handles non-uniform query lengths.
         (num_decodes, _, num_decode_tokens, num_prefill_tokens) = (
             split_decodes_and_prefills(
                 cm,
-                decode_threshold=self.reorder_batch_threshold or 1,
+                decode_threshold=self.c128a_decode_threshold,
             )
         )
 
