@@ -1,5 +1,10 @@
 # 1Cat-vLLM
 
+> [!IMPORTANT]
+> **This repository is no longer maintained.** Use **[sglang-sxm2](https://github.com/dg1kjd/sglang-sxm2)** instead: an agentic-coding inference engine for N× V100-SXM2, based on SGLang. It has a better engine architecture and model backbone, runs more stably, keeps agent sessions in a radix prefix cache, and is faster overall.
+>
+> Support for this 1Cat-vLLM-based fork has ended. The repository stays online so its changes can still be cherry-picked into [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) and other forks.
+
 > 一猫之下始终相信，V100 不该在今天的大模型浪潮中被轻易宣判“过时”。
 >
 > 1Cat-vLLM 是一个专注于 **SM70 / Tesla V100** 的 vLLM 工程分支。我们
